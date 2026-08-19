@@ -69,12 +69,14 @@ function validateTick(tick) {
 }
 
 function acceptTick(tick) {
+  const rawVolume = Number(tick.volume);
   const clean = {
     symbol: String(tick.symbol),
     bid: Number(tick.bid),
     ask: Number(tick.ask),
     digits: tick.digits != null ? Number(tick.digits) : null,
     time: tick.time != null ? Number(tick.time) : null,
+    volume: Number.isFinite(rawVolume) && rawVolume >= 0 ? Math.trunc(rawVolume) : 1,
     received_at: Date.now()
   };
   lastTick = clean;
