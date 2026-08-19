@@ -6,6 +6,8 @@ const WebSocket = require("ws");
 
 const app = express();
 const FIVE_MINUTES = 5 * 60 * 1000;
+const HISTORY_PACKET_MAX_AGE = 30 * 1000;
+const HISTORY_BAR_MAX_LAG = 15 * 60 * 1000;
 
 app.use(express.json({ limit: "256kb" }));
 app.use(express.text({ type: "*/*", limit: "256kb" }));
@@ -15,6 +17,24 @@ const wss = new WebSocket.Server({ server, path: "/ws" });
 
 let lastTick = null;
 let lastCandlePacket = null;
+
+function latestPacketCandleTime(packet) {
+  if (!packet || !Array.isArray(packet.candles) || !packet.candles.length) return NaN;
+  return Math.max(...packet.candles.map((candle) => Number(candle.time)).filter(Number.isFinite));
+}
+
+function isFreshCandlePacket(packet, now = Date.now()) {
+  if (!packet || !Number.isFinite(Number(packet.received_at))) return false;
+  const receivedAt = Number(packet.received_at);
+  if (receivedAt > now + 5000 || now - receivedAt > HISTORY_PACKET_MAX_AGE) return false;
+  const latest = latestPacketCandleTime(packet);
+  const expectedLatestStart = Math.floor(now / FIVE_MINUTES) * FIVE_MINUTES - FIVE_MINUTES;
+  return Number.isFinite(latest) && expectedLatestStart - latest <= HISTORY_BAR_MAX_LAG;
+}
+
+function freshCandlePacket(now = Date.now()) {
+  return isFreshCandlePacket(lastCandlePacket, now) ? lastCandlePacket : null;
+}
 
 function normalizeBody(req) {
   if (req.body && typeof req.body === "object") return req.body;
@@ -94,11 +114,17 @@ function normalizeCandlePacket(packet) {
 
   const candles = [...candlesByTime.values()].sort((left, right) => left.time - right.time);
   if (!candles.length) throw new Error("No valid completed M5 candles received");
+  const latestCandleTime = candles[candles.length - 1].time;
+  const expectedLatestStart = currentStart - FIVE_MINUTES;
+  if (expectedLatestStart - latestCandleTime > HISTORY_BAR_MAX_LAG) {
+    throw new Error("Broker M5 history is outdated; waiting for current completed bars");
+  }
   return {
     type: "candles",
     symbol: String(packet.symbol),
     interval: "M5",
     candles,
+    latest_candle_time: latestCandleTime,
     received_at: receivedAt
   };
 }
@@ -124,20 +150,28 @@ app.post("/candles", (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({
-  ok: true,
-  lastTick,
-  broker_candles: lastCandlePacket ? lastCandlePacket.candles.length : 0,
-  latest_broker_candle: lastCandlePacket && lastCandlePacket.candles.length
-    ? lastCandlePacket.candles[lastCandlePacket.candles.length - 1]
-    : null
-}));
+app.get("/health", (_req, res) => {
+  const freshHistory = freshCandlePacket();
+  return res.json({
+    ok: true,
+    lastTick,
+    broker_history_fresh: Boolean(freshHistory),
+    broker_history_packet_age_ms: lastCandlePacket ? Math.max(0, Date.now() - Number(lastCandlePacket.received_at || 0)) : null,
+    broker_candles: freshHistory ? freshHistory.candles.length : 0,
+    latest_broker_candle: freshHistory ? freshHistory.candles[freshHistory.candles.length - 1] : null
+  });
+});
 app.get("/last", (_req, res) => res.json(lastTick || { ok: false }));
-app.get("/candles", (_req, res) => res.json(lastCandlePacket || { ok: false, candles: [] }));
+app.get("/candles", (_req, res) => {
+  const freshHistory = freshCandlePacket();
+  if (!freshHistory) return res.status(503).json({ ok: false, candles: [], error: "No fresh broker M5 history is available" });
+  return res.json(freshHistory);
+});
 app.get("/", (_req, res) => res.send("HT5 Stream Server: /health, /last, POST /tick, POST/GET /candles, WS /ws"));
 
 wss.on("connection", (socket) => {
-  if (lastCandlePacket) socket.send(JSON.stringify(lastCandlePacket));
+  const freshHistory = freshCandlePacket();
+  if (freshHistory) socket.send(JSON.stringify(freshHistory));
   if (lastTick) socket.send(JSON.stringify(lastTick));
 });
 
