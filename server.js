@@ -6,17 +6,34 @@ const WebSocket = require("ws");
 
 const app = express();
 const FIVE_MINUTES = 5 * 60 * 1000;
-const HISTORY_PACKET_MAX_AGE = 30 * 1000;
-const HISTORY_BAR_MAX_LAG = 15 * 60 * 1000;
+const HISTORY_PACKET_MAX_AGE = 3 * 60 * 1000;
+const HISTORY_BAR_MAX_LAG = 4 * 24 * 60 * 60 * 1000;
+const HISTORY_RETENTION = 30 * 24 * 60 * 60 * 1000;
+const MAX_CANDLES_PER_SYMBOL = 500;
+const HT5_SYMBOLS = Object.freeze([
+  "XAUUSD",
+  "EURUSD",
+  "AUDJPY",
+  "EURCAD",
+  "AUDUSD",
+  "AUDCHF",
+  "EURCHF",
+  "CHFJPY",
+  "EURAUD"
+]);
 
-app.use(express.json({ limit: "256kb" }));
-app.use(express.text({ type: "*/*", limit: "256kb" }));
+app.use(express.json({ limit: "2mb" }));
+app.use(express.text({ type: "*/*", limit: "2mb" }));
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/ws" });
+const ticksBySymbol = new Map();
+const candlePacketsBySymbol = new Map();
 
-let lastTick = null;
-let lastCandlePacket = null;
+function canonicalSymbol(value) {
+  const raw = String(value || "").trim().toUpperCase();
+  return HT5_SYMBOLS.find((symbol) => raw === symbol || raw.startsWith(`${symbol}.`) || raw.startsWith(`${symbol}+`) || raw.startsWith(`${symbol}_`) || raw.startsWith(`${symbol}-`)) || "";
+}
 
 function latestPacketCandleTime(packet) {
   if (!packet || !Array.isArray(packet.candles) || !packet.candles.length) return NaN;
@@ -32,8 +49,9 @@ function isFreshCandlePacket(packet, now = Date.now()) {
   return Number.isFinite(latest) && expectedLatestStart - latest <= HISTORY_BAR_MAX_LAG;
 }
 
-function freshCandlePacket(now = Date.now()) {
-  return isFreshCandlePacket(lastCandlePacket, now) ? lastCandlePacket : null;
+function freshCandlePacket(symbol, now = Date.now()) {
+  const packet = candlePacketsBySymbol.get(canonicalSymbol(symbol));
+  return isFreshCandlePacket(packet, now) ? packet : null;
 }
 
 function normalizeBody(req) {
@@ -59,36 +77,52 @@ function broadcast(payload) {
 }
 
 function validateTick(tick) {
-  if (!tick) return "Body is empty or not valid JSON";
+  if (!tick || typeof tick !== "object") return "Body is empty or not valid JSON";
   if (!tick.symbol) return "Missing symbol";
+  if (!canonicalSymbol(tick.symbol)) return `Unsupported symbol ${String(tick.symbol)}`;
   if (tick.bid == null) return "Missing bid";
   if (tick.ask == null) return "Missing ask";
   if (!Number.isFinite(Number(tick.bid))) return "bid is not a number";
   if (!Number.isFinite(Number(tick.ask))) return "ask is not a number";
+  if (Number(tick.bid) <= 0 || Number(tick.ask) < Number(tick.bid)) return "Invalid bid/ask";
   return null;
 }
 
 function acceptTick(tick) {
+  const symbol = canonicalSymbol(tick.symbol);
   const rawVolume = Number(tick.volume);
+  const bid = Number(tick.bid);
+  const ask = Number(tick.ask);
+  const midpoint = (bid + ask) / 2;
+  const dailyOpen = tick.daily_open != null ? Number(tick.daily_open) : NaN;
+  const suppliedDailyChange = tick.daily_change_percent != null ? Number(tick.daily_change_percent) : NaN;
+  const dailyChangePercent = Number.isFinite(suppliedDailyChange)
+    ? suppliedDailyChange
+    : Number.isFinite(dailyOpen) && dailyOpen > 0
+      ? (midpoint - dailyOpen) / dailyOpen * 100
+      : null;
   const clean = {
-    symbol: String(tick.symbol),
-    bid: Number(tick.bid),
-    ask: Number(tick.ask),
-    digits: tick.digits != null ? Number(tick.digits) : null,
+    symbol,
+    broker_symbol: String(tick.broker_symbol || tick.symbol),
+    bid,
+    ask,
+    digits: tick.digits != null && Number.isFinite(Number(tick.digits)) ? Number(tick.digits) : null,
     time: tick.time != null ? Number(tick.time) : null,
     volume: Number.isFinite(rawVolume) && rawVolume >= 0 ? Math.trunc(rawVolume) : 1,
+    daily_open: Number.isFinite(dailyOpen) && dailyOpen > 0 ? dailyOpen : null,
+    daily_change_percent: Number.isFinite(dailyChangePercent) ? dailyChangePercent : null,
     received_at: Date.now()
   };
-  lastTick = clean;
-  broadcast(clean);
+  ticksBySymbol.set(symbol, clean);
   return clean;
 }
 
 function normalizeCandlePacket(packet) {
   if (!packet || typeof packet !== "object") throw new Error("Body is empty or not valid JSON");
-  if (!packet.symbol) throw new Error("Missing symbol");
+  const symbol = canonicalSymbol(packet.symbol);
+  if (!symbol) throw new Error(`Unsupported symbol ${String(packet.symbol || "(missing)")}`);
   if (!Array.isArray(packet.candles) || !packet.candles.length) throw new Error("Missing candles array");
-  if (packet.candles.length > 100) throw new Error("Maximum 100 candles per request");
+  if (packet.candles.length > MAX_CANDLES_PER_SYMBOL) throw new Error(`Maximum ${MAX_CANDLES_PER_SYMBOL} candles per request`);
 
   const receivedAt = Date.now();
   const brokerClock = epochMilliseconds(packet.server_time);
@@ -107,14 +141,20 @@ function normalizeCandlePacket(packet) {
     if (![rawTime, open, high, low, close].every(Number.isFinite)) return;
     if (open <= 0 || close <= 0 || high < Math.max(open, close) || low > Math.min(open, close) || low <= 0) return;
 
-    // MT5 bar times follow the broker clock. Remove its offset and round away
-    // sub-second HTTP latency so the result lands on the correct local M5 slot.
     const time = Math.round((rawTime - clockOffset) / FIVE_MINUTES) * FIVE_MINUTES;
-    if (time >= currentStart || time < currentStart - 7 * 24 * 60 * 60 * 1000) return;
+    if (time >= currentStart || time < currentStart - HISTORY_RETENTION) return;
     candlesByTime.set(time, { time, open, high, low, close, volume, confirmed: true, source: "broker-history" });
   });
 
-  const candles = [...candlesByTime.values()].sort((left, right) => left.time - right.time);
+  const existing = candlePacketsBySymbol.get(symbol);
+  if (existing && Array.isArray(existing.candles)) {
+    existing.candles.forEach((candle) => {
+      if (!candlesByTime.has(candle.time)) candlesByTime.set(candle.time, candle);
+    });
+  }
+  const candles = [...candlesByTime.values()]
+    .sort((left, right) => left.time - right.time)
+    .slice(-MAX_CANDLES_PER_SYMBOL);
   if (!candles.length) throw new Error("No valid completed M5 candles received");
   const latestCandleTime = candles[candles.length - 1].time;
   const expectedLatestStart = currentStart - FIVE_MINUTES;
@@ -123,7 +163,8 @@ function normalizeCandlePacket(packet) {
   }
   return {
     type: "candles",
-    symbol: String(packet.symbol),
+    symbol,
+    broker_symbol: String(packet.broker_symbol || packet.symbol),
     interval: "M5",
     candles,
     latest_candle_time: latestCandleTime,
@@ -135,17 +176,33 @@ app.post(["/tick", "/webhook"], (req, res) => {
   const tick = normalizeBody(req);
   const error = validateTick(tick);
   if (error) return res.status(400).json({ ok: false, error });
-  return res.json({ ok: true, saved: acceptTick(tick) });
+  const saved = acceptTick(tick);
+  broadcast(saved);
+  return res.json({ ok: true, saved });
+});
+
+app.post("/ticks", (req, res) => {
+  const body = normalizeBody(req);
+  const rows = Array.isArray(body) ? body : body && Array.isArray(body.ticks) ? body.ticks : [];
+  if (!rows.length || rows.length > HT5_SYMBOLS.length) return res.status(400).json({ ok: false, error: `Expected 1-${HT5_SYMBOLS.length} ticks` });
+  const errors = rows.map(validateTick).filter(Boolean);
+  if (errors.length) return res.status(400).json({ ok: false, error: errors[0] });
+  const ticks = rows.map(acceptTick);
+  const packet = { type: "ticks", ticks, received_at: Date.now() };
+  broadcast(packet);
+  return res.json({ ok: true, saved: ticks.length, symbols: ticks.map((tick) => tick.symbol) });
 });
 
 app.post("/candles", (req, res) => {
   try {
-    lastCandlePacket = normalizeCandlePacket(normalizeBody(req));
-    broadcast(lastCandlePacket);
+    const packet = normalizeCandlePacket(normalizeBody(req));
+    candlePacketsBySymbol.set(packet.symbol, packet);
+    broadcast(packet);
     return res.json({
       ok: true,
-      saved: lastCandlePacket.candles.length,
-      latest: lastCandlePacket.candles[lastCandlePacket.candles.length - 1]
+      symbol: packet.symbol,
+      saved: packet.candles.length,
+      latest: packet.candles[packet.candles.length - 1]
     });
   } catch (error) {
     return res.status(400).json({ ok: false, error: error.message });
@@ -153,29 +210,63 @@ app.post("/candles", (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  const freshHistory = freshCandlePacket();
-  return res.json({
-    ok: true,
-    lastTick,
-    broker_history_fresh: Boolean(freshHistory),
-    broker_history_packet_age_ms: lastCandlePacket ? Math.max(0, Date.now() - Number(lastCandlePacket.received_at || 0)) : null,
-    broker_candles: freshHistory ? freshHistory.candles.length : 0,
-    latest_broker_candle: freshHistory ? freshHistory.candles[freshHistory.candles.length - 1] : null
+  const now = Date.now();
+  const symbols = HT5_SYMBOLS.map((symbol) => {
+    const tick = ticksBySymbol.get(symbol) || null;
+    const packet = freshCandlePacket(symbol, now);
+    return {
+      symbol,
+      tick,
+      broker_history_fresh: Boolean(packet),
+      broker_history_packet_age_ms: packet ? Math.max(0, now - Number(packet.received_at || 0)) : null,
+      broker_candles: packet ? packet.candles.length : 0,
+      latest_broker_candle: packet ? packet.candles[packet.candles.length - 1] : null
+    };
   });
+  return res.json({ ok: true, configured_symbols: HT5_SYMBOLS, symbols });
 });
-app.get("/last", (_req, res) => res.json(lastTick || { ok: false }));
-app.get("/candles", (_req, res) => {
-  const freshHistory = freshCandlePacket();
-  if (!freshHistory) return res.status(503).json({ ok: false, candles: [], error: "No fresh broker M5 history is available" });
-  return res.json(freshHistory);
+
+app.get("/last", (req, res) => {
+  const requested = canonicalSymbol(req.query.symbol);
+  if (requested) return res.json(ticksBySymbol.get(requested) || { ok: false, symbol: requested });
+  return res.json({ type: "ticks", ticks: [...ticksBySymbol.values()], received_at: Date.now() });
 });
-app.get("/", (_req, res) => res.send("HT5 Stream Server: /health, /last, POST /tick, POST/GET /candles, WS /ws"));
+
+app.get("/candles", (req, res) => {
+  const requested = canonicalSymbol(req.query.symbol);
+  if (requested) {
+    const packet = freshCandlePacket(requested);
+    if (!packet) return res.status(503).json({ ok: false, symbol: requested, candles: [], error: "No fresh broker M5 history is available" });
+    return res.json(packet);
+  }
+  const packets = HT5_SYMBOLS.map((symbol) => freshCandlePacket(symbol)).filter(Boolean);
+  if (!packets.length) return res.status(503).json({ ok: false, packets: [], error: "No fresh broker M5 history is available" });
+  return res.json({ type: "candles-batch", packets, received_at: Date.now() });
+});
+
+app.get("/", (_req, res) => res.send("HT5 Multi-Symbol Stream Server: /health, /last, POST /tick, POST /ticks, POST/GET /candles, WS /ws"));
 
 wss.on("connection", (socket) => {
-  const freshHistory = freshCandlePacket();
-  if (freshHistory) socket.send(JSON.stringify(freshHistory));
-  if (lastTick) socket.send(JSON.stringify(lastTick));
+  HT5_SYMBOLS.forEach((symbol) => {
+    const packet = freshCandlePacket(symbol);
+    if (packet) socket.send(JSON.stringify(packet));
+  });
+  const ticks = [...ticksBySymbol.values()];
+  if (ticks.length) socket.send(JSON.stringify({ type: "ticks", ticks, received_at: Date.now() }));
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log("HT5 stream server running on port", PORT));
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  server.listen(PORT, () => console.log("HT5 multi-symbol stream server running on port", PORT));
+}
+
+module.exports = {
+  HT5_SYMBOLS,
+  MAX_CANDLES_PER_SYMBOL,
+  app,
+  canonicalSymbol,
+  normalizeCandlePacket,
+  server,
+  ticksBySymbol,
+  candlePacketsBySymbol
+};
