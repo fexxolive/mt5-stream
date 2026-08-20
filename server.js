@@ -96,6 +96,8 @@ function acceptTick(tick) {
   const midpoint = (bid + ask) / 2;
   const dailyOpen = tick.daily_open != null ? Number(tick.daily_open) : NaN;
   const suppliedDailyChange = tick.daily_change_percent != null ? Number(tick.daily_change_percent) : NaN;
+  const swapLong = tick.swap_long != null ? Number(tick.swap_long) : NaN;
+  const swapShort = tick.swap_short != null ? Number(tick.swap_short) : NaN;
   const dailyChangePercent = Number.isFinite(suppliedDailyChange)
     ? suppliedDailyChange
     : Number.isFinite(dailyOpen) && dailyOpen > 0
@@ -111,6 +113,8 @@ function acceptTick(tick) {
     volume: Number.isFinite(rawVolume) && rawVolume >= 0 ? Math.trunc(rawVolume) : 1,
     daily_open: Number.isFinite(dailyOpen) && dailyOpen > 0 ? dailyOpen : null,
     daily_change_percent: Number.isFinite(dailyChangePercent) ? dailyChangePercent : null,
+    swap_long: Number.isFinite(swapLong) ? swapLong : null,
+    swap_short: Number.isFinite(swapShort) ? swapShort : null,
     received_at: Date.now()
   };
   ticksBySymbol.set(symbol, clean);
