@@ -3,6 +3,7 @@
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
+const { normalizeBrokerClockOffset } = require("./feed-utils.cjs");
 
 const app = express();
 const FIVE_MINUTES = 5 * 60 * 1000;
@@ -129,8 +130,10 @@ function normalizeCandlePacket(packet) {
   if (packet.candles.length > MAX_CANDLES_PER_SYMBOL) throw new Error(`Maximum ${MAX_CANDLES_PER_SYMBOL} candles per request`);
 
   const receivedAt = Date.now();
-  const brokerClock = epochMilliseconds(packet.server_time);
-  const clockOffset = Number.isFinite(brokerClock) ? brokerClock - receivedAt : 0;
+  // Never derive the broker offset from wall-clock receipt time alone. MT5's
+  // TimeCurrent can freeze while the market is closed and that used to slide
+  // the final Friday candles forward across the weekend on every new post.
+  const clockOffset = normalizeBrokerClockOffset(packet.server_time, packet.utc_time, receivedAt);
   const currentStart = Math.floor(receivedAt / FIVE_MINUTES) * FIVE_MINUTES;
   const candlesByTime = new Map();
 
