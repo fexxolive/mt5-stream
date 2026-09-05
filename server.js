@@ -3,7 +3,27 @@
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
-const { normalizeBrokerClockOffset } = require("./feed-utils.cjs");
+// Kept inline because the Render stream repository deploys server.js as a
+// standalone service and does not include the desktop terminal's utilities.
+function normalizeBrokerClockOffset(serverTime, utcTime, receivedAt = Date.now()) {
+  const optionalClock = (value) => {
+    if (value == null || value === "") return NaN;
+    let timestamp = Number(value);
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return NaN;
+    if (timestamp < 100000000000) timestamp *= 1000;
+    return Math.trunc(timestamp);
+  };
+  const brokerClock = optionalClock(serverTime);
+  const utcClock = optionalClock(utcTime);
+  const receiptClock = optionalClock(receivedAt);
+  const reportedOffset = Number.isFinite(brokerClock) && Number.isFinite(utcClock)
+    ? brokerClock - utcClock
+    : NaN;
+  const maximumBrokerOffset = 6 * 60 * 60 * 1000;
+  if (Number.isFinite(reportedOffset) && Math.abs(reportedOffset) <= maximumBrokerOffset) return reportedOffset;
+  const receiptOffset = Number.isFinite(brokerClock) ? brokerClock - receiptClock : NaN;
+  return Number.isFinite(receiptOffset) && Math.abs(receiptOffset) <= maximumBrokerOffset ? receiptOffset : 0;
+}
 
 const app = express();
 const FIVE_MINUTES = 5 * 60 * 1000;
