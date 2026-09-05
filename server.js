@@ -3,6 +3,7 @@
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
+
 // Kept inline because the Render stream repository deploys server.js as a
 // standalone service and does not include the desktop terminal's utilities.
 function normalizeBrokerClockOffset(serverTime, utcTime, receivedAt = Date.now()) {
